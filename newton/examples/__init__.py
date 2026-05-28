@@ -749,7 +749,15 @@ def init(parser=None):
     elif args.viewer == "rtx":
         viewer = newton.viewer.ViewerRTX(headless=args.headless, paused=args.paused, num_frames=args.num_frames)
     elif args.viewer == "rerun":
-        viewer = newton.viewer.ViewerRerun(address=args.rerun_address)
+        # keep_historical_data=True → log every frame at its timestamp so the
+        # rerun timeline is scrubbable / replayable (default False only shows
+        # the current frame). Static rigid meshes are still uploaded once;
+        # only per-frame state (deformable verts + transforms) accumulates.
+        # num_frames so the run stops after N frames instead of streaming
+        # forever — for remote connections is_running() is otherwise always True.
+        viewer = newton.viewer.ViewerRerun(
+            address=args.rerun_address, keep_historical_data=True, num_frames=args.num_frames
+        )
     elif args.viewer == "null":
         viewer = newton.viewer.ViewerNull(
             num_frames=args.num_frames,

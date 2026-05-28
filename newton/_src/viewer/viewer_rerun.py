@@ -120,6 +120,7 @@ class ViewerRerun(ViewerBase):
         keep_historical_data: bool = False,
         keep_scalar_history: bool = True,
         record_to_rrd: str | None = None,
+        num_frames: int | None = None,
     ):
         """
         Initialize the ViewerRerun backend for Newton using the Rerun.io visualization library.
@@ -146,6 +147,7 @@ class ViewerRerun(ViewerBase):
                 If True, the historical simulation data is kept in the viewer to be able to scrub through the simulation timeline. Defaults to False.
             keep_scalar_history: If True, historical scala data logged via :meth:`ViewerRerun.log_scalar` is kept in the viewer.
             record_to_rrd: Path to record the viewer to a ``*.rrd`` recording file (e.g. "my_recording.rrd"). If None, the viewer will not record to a file.
+            num_frames: If set, :meth:`is_running` returns False once this many frames have been logged, so headless/remote runs stop on their own instead of streaming forever. If None, runs until :meth:`close`.
         """
         if rr is None:
             raise ImportError("rerun package is required for ViewerRerun. Install with: pip install rerun-sdk")
@@ -155,6 +157,8 @@ class ViewerRerun(ViewerBase):
         self.app_id = app_id or "newton-viewer"
         self._running = True
         self._viewer_process = None
+        self.num_frames = num_frames
+        self._frame_count = 0
         self.keep_historical_data = keep_historical_data
         self.keep_scalar_history = keep_scalar_history
 
@@ -432,6 +436,7 @@ class ViewerRerun(ViewerBase):
             time: The current simulation time.
         """
         self.time = time
+        self._frame_count += 1
         # Set the timeline for this frame
         rr.set_time("time", timestamp=time)
 
@@ -454,6 +459,10 @@ class ViewerRerun(ViewerBase):
         Returns:
             bool: True if the viewer is running, False otherwise.
         """
+        # Stop after num_frames so headless/remote streaming runs end on their
+        # own instead of looping forever (the main loop only exits on is_running).
+        if self.num_frames is not None and self._frame_count >= self.num_frames:
+            return False
         # Check if viewer process is still alive
         if self._viewer_process is not None:
             return self._viewer_process.poll() is None
