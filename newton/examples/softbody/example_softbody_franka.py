@@ -227,6 +227,10 @@ class Example:
 
     def capture(self):
         if wp.get_device().is_cuda:
+            # Warmup: run once OUTSIDE capture so every kernel (esp. the IK
+            # `_lm_solve_tiled` LM solver) is compiled+loaded. CUDA < 12.4
+            # forbids module loading during stream capture (error 900).
+            self.simulate()
             with wp.ScopedCapture() as capture:
                 self.simulate()
             self.graph = capture.graph
