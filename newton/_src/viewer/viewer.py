@@ -145,6 +145,11 @@ class ViewerBase(ABC):
         self.show_static = False
         self.show_inertia_boxes = False
         self.show_hydro_contact_surface = False
+        # Optional hook to customize a shape's Rerun/GL entity path. Signature
+        # (shape_index: int, group: str, batch_index: int) -> str. Lets callers
+        # group shapes by object (e.g. /franka/<group>, /box) instead of the
+        # default flat /model/<group>/shape_N. None -> default naming.
+        self.shape_path_fn = None
         self.sdf_margin_mode: ViewerBase.SDFMarginMode = ViewerBase.SDFMarginMode.OFF
 
         self.gaussians_max_points = 100_000  # Max number of points to visualize per gaussian
@@ -1697,7 +1702,20 @@ class ViewerBase(ABC):
 
             # ensure batch exists
             if shape_hash not in self._shape_instances:
-                shape_name = f"/model/shapes/shape_{len(self._shape_instances)}"
+                # Split collision geometry from visual geometry into separate entity
+                # paths so they can be toggled/inspected independently in the viewer.
+                # COLLIDE flag takes priority: anything that participates in contact
+                # (arm hulls, table, ground — incl. dual-flagged COLLIDE+VISIBLE) goes
+                # to /model/collision; purely-visual shapes go to /model/visual. This
+                # keeps the table/ground in the collision view and out of the visual
+                # toggle, so hiding /model/visual no longer removes them.
+                has_collide_flag = bool(flags & int(newton.ShapeFlags.COLLIDE_SHAPES))
+                group = "collision" if has_collide_flag else "visual"
+                batch_index = len(self._shape_instances)
+                if self.shape_path_fn is not None:
+                    shape_name = self.shape_path_fn(s, group, batch_index)
+                else:
+                    shape_name = f"/model/{group}/shape_{batch_index}"
                 batch = ViewerBase.ShapeInstances(shape_name, static, flags, mesh_name, self.device)
                 batch.geo_type = geo_type
                 self._shape_instances[shape_hash] = batch
