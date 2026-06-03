@@ -1,11 +1,13 @@
 #!/usr/bin/env python
-"""Step-by-step exploration of the Allegro-hand model.
+"""Step-by-step reimplementation of the soft-body Franka (MuJoCo) example.
 
-Reference example:
-  newton/examples/robot/example_robot_allegro_hand.py
+Reference examples:
+  newton/playground/example_softbody_franka_mujoco.py
+  newton/examples/softbody/example_softbody_franka.py
 
-We build it up incrementally so each inner stage can be inspected. Run after
-the reverse SSH tunnel to the Mac's Rerun viewer is up:
+A Franka Panda arm (driven later by GPU IK) manipulates a deformable rubber
+duck on a table. We build it up incrementally so each inner stage can be
+inspected. Run after the reverse SSH tunnel to the Mac's Rerun viewer is up:
     # on the Mac:        rerun                 (listens on :9876)
     # reconnect:         ssh -R 9876:localhost:9876 <this-server>
 
@@ -20,6 +22,7 @@ from __future__ import annotations
 
 import numpy as np
 import warp as wp
+from pxr import Usd
 
 import newton
 import newton.utils
@@ -51,75 +54,123 @@ print("Step 1 done — visualizer is up. (model / sim not built yet.)")
 
 
 # ----------------------------------------------------------------------------
-# STEP 2 — build the scene: Allegro hand (+ cube) + ground.
+# STEP 2 — build the scene: Franka arm + table + deformable duck + ground.
 # ----------------------------------------------------------------------------
 # %%
 
-def build_scene() -> "newton.Model":
-    """Assemble the Allegro-hand scene and return the finalized `newton.Model`.
+# Franka keyframe sequence (reused later for IK target tracking):
+# [duration, px, py, pz, qx, qy, qz, qw, gripper_activation] (positions in m).
+_GRIPPER_OPEN = 1.0
+_GRIPPER_CLOSE = 0.5
+_ROBOT_KEY_POSES = np.array(
+    [
+        # approach: move above the duck
+        [2.5, -0.005, -0.5, 0.35, 1, 0.0, 0.0, 0.0, _GRIPPER_OPEN],
+        # descend: lower to duck body
+        [2.0, -0.005, -0.5, 0.21, 1, 0.0, 0.0, 0.0, _GRIPPER_OPEN],
+        # pinch: close gripper on duck
+        [2.5, -0.005, -0.5, 0.21, 1, 0.0, 0.0, 0.0, _GRIPPER_CLOSE],
+        # lift: raise duck off table
+        [2.0, -0.005, -0.5, 0.35, 1, 0.0, 0.0, 0.0, _GRIPPER_CLOSE],
+        # hold: pause in air
+        [2.0, -0.005, -0.5, 0.35, 1, 0.0, 0.0, 0.0, _GRIPPER_CLOSE],
+        # place: lower back to table
+        [2.0, -0.005, -0.5, 0.21, 1, 0.0, 0.0, 0.0, _GRIPPER_CLOSE],
+        # release: open gripper
+        [1.0, -0.005, -0.5, 0.21, 1, 0.0, 0.0, 0.0, _GRIPPER_OPEN],
+        # retract: move away
+        [2.0, -0.005, -0.5, 0.35, 1, 0.0, 0.0, 0.0, _GRIPPER_OPEN],
+    ],
+    dtype=np.float32,
+)
 
-    Loads the Wonik Allegro left hand from USD (the asset bundles a manipulation
-    cube as a free-floating body) into one explicit world (env_0); the ground
-    plane is global (world -1). Returns the finalized model — no states/solvers
-    yet. A per-shape object label (/hand, /cube, /ground) is attached for
-    make_shape_path_fn.
+
+def build_scene() -> "newton.Model":
+    """Assemble the Franka soft-body scene and return the finalized `newton.Model`.
+
+    Mirrors `examples/softbody/example_softbody_franka.py` (meter scale): a
+    fixed-base Franka Panda (URDF) reaches over a static table to manipulate a
+    deformable rubber duck (tetrahedral mesh, simulated later with VBD); the
+    ground plane is global (world -1). Returns the finalized model — no
+    states/solvers yet. A per-shape object label (/franka, /table, /ground) is
+    attached for make_shape_path_fn; the duck is a particle/tet soft body and
+    renders as particles, not shapes. Franka metadata used by later IK steps
+    (endeffector body id + keyframe targets) is stashed on the model.
     """
     scene = ModelBuilder(gravity=-9.81)
-    scene.default_shape_cfg.ke = 1.0e3
-    scene.default_shape_cfg.kd = 1.0e2
-    scene.default_shape_cfg.margin = 0.005
-    scene.default_shape_cfg.gap = 0.015
 
     # Global (world -1): shared ground plane.
     scene.add_ground_plane()
     n_ground = scene.shape_count   # ground shapes: [0, n_ground)
 
-    # --- One explicit world: Allegro hand + an explicit cube (env_0) --------
+    # --- One explicit world: Franka + table + deformable duck (env_0) --------
     scene.begin_world(label="env_0")
 
-    # HAND ONLY — exclude the USD's bundled cube subtree (/.../object/*); we add
-    # our own cube below so the two are decoupled.
-    asset_path = newton.utils.download_asset("wonik_allegro")
-    asset_file = str(asset_path / "usd" / "allegro_left_hand_with_cube.usda")
-    scene.add_usd(
-        asset_file,
-        xform=wp.transform(wp.vec3(0.0, 0.0, 0.5)),
+    # Franka arm (URDF). Fixed-base; URDF is in meters.
+    asset_path = newton.utils.download_asset("franka_emika_panda")
+    scene.add_urdf(
+        str(asset_path / "urdf" / "fr3_franka_hand.urdf"),
+        xform=wp.transform((-0.5, -0.5, -0.1), wp.quat_identity()),
+        floating=False,
+        scale=1.0,
         enable_self_collisions=False,
-        ignore_paths=[".*Dummy", ".*CollisionPlane", ".*object.*"],  # drop bundled cube
-        hide_collision_shapes=False,   # keep collision shapes -> shown under /…/collision
+        collapse_fixed_joints=True,
+        force_show_colliders=False,
     )
-    n_hand = scene.shape_count   # hand shapes: [n_ground, n_hand)
+    scene.joint_q[:6] = [0.0, 0.0, 0.0, -1.59695, 0.0, 2.5307]
+    # End-effector link (gripper hand) is 3 bodies before the end (hand + 2 fingers).
+    endeffector_id = scene.body_count - 3
+    n_franka = scene.shape_count   # franka shapes: [n_ground, n_franka)
 
-    # Natural finger pose (fixed-base hand: every DOF is a finger revolute).
-    # Fingers 0.3 rad; the proximal "_0" joints 0.6.
-    for i in range(scene.joint_dof_count):
-        scene.joint_q[i] = 0.6 if scene.joint_label[i][-2:] == "_0" else 0.3
-
-    # CUBE added EXPLICITLY (not from USD), but matched to the USD DexCube config:
-    # its USD transform is (0, -0.17, 0.56) with identity rotation and box
-    # half-extents 0.036; we add the (0,0,0.5) hand load offset -> world (0,-0.17,1.06).
-    # add_body already gives the body a 6-DOF FREE joint (free-floating by default),
-    # so we do NOT call add_joint_free (that would add a redundant 2nd free joint).
-    cube_cfg = ModelBuilder.ShapeConfig(density=500.0)
-    cube_body = scene.add_body(
-        label="cube",
-        xform=wp.transform(wp.vec3(0.0, -0.17, 1.06), wp.quat_identity()),
+    # Static table (box shape on the world's static frame, body -1).
+    scene.add_shape_box(
+        -1,
+        wp.transform(wp.vec3(0.0, -0.5, 0.1), wp.quat_identity()),
+        hx=0.4,
+        hy=0.4,
+        hz=0.1,
     )
-    scene.add_shape_box(cube_body, hx=0.036, hy=0.036, hz=0.036, cfg=cube_cfg)
-    n_cube = scene.shape_count   # cube shapes: [n_hand, n_cube)
+    n_table = scene.shape_count   # table shape: [n_franka, n_table)
+
+    # Deformable rubber duck (pre-computed tetrahedral mesh from USD).
+    # Table top is at z=0.2m; duck center sits ~0.03m above it. add_soft_mesh
+    # creates particles/tets (a soft body), not rigid shapes.
+    duck_path = newton.utils.download_asset("manipulation_objects/rubber_duck")
+    usd_stage = Usd.Stage.Open(str(duck_path / "model.usda"))
+    prim = usd_stage.GetPrimAtPath("/root/Model/TetMesh")
+    tetmesh = newton.TetMesh.create_from_usd(prim)
+    scene.add_soft_mesh(
+        pos=wp.vec3(0.0, -0.5, 0.23),
+        rot=wp.quat_identity(),
+        scale=1.0,  # already in meters
+        vel=wp.vec3(0.0, 0.0, 0.0),
+        mesh=tetmesh,
+        density=100.0,
+        k_mu=1.0e6,
+        k_lambda=1.0e6,
+        k_damp=1e-6,
+        particle_radius=0.005,
+    )
 
     scene.end_world()
+
+    # VBD graph coloring for the soft body (harmless before solver setup).
+    scene.color()
 
     model = scene.finalize(requires_grad=False)
 
     # Per-shape object label by build-order range (robust, no body-index guessing).
-    assert model.shape_count == n_cube, "shape order/count changed at finalize"
-    shape_object = ["hand"] * n_cube
+    assert model.shape_count == n_table, "shape order/count changed at finalize"
+    shape_object = ["franka"] * n_table
     for i in range(n_ground):
         shape_object[i] = "ground"
-    for i in range(n_hand, n_cube):
-        shape_object[i] = "cube"
+    for i in range(n_franka, n_table):
+        shape_object[i] = "table"
     model._explore_shape_object = shape_object
+
+    # Stash Franka metadata for later IK steps.
+    model._explore_endeffector_id = endeffector_id
+    model._explore_robot_key_poses = _ROBOT_KEY_POSES
 
     return model
 
@@ -127,10 +178,11 @@ def build_scene() -> "newton.Model":
 # %%
 
 model = build_scene()
-print("Step 2 done — Allegro hand scene built.")
+print("Step 2 done — Franka + table + duck scene built.")
 print(f"  bodies   : {model.body_count}")
 print(f"  shapes   : {model.shape_count}")
 print(f"  joints   : {model.joint_count}  | dofs: {model.joint_dof_count}")
+print(f"  particles: {model.particle_count}  (rubber duck soft body)")
 
 
 # ----------------------------------------------------------------------------
@@ -141,9 +193,10 @@ print(f"  joints   : {model.joint_count}  | dofs: {model.joint_dof_count}")
 def make_shape_path_fn(model):
     """Object-centric Rerun entity paths for this scene, from
     `model._explore_shape_object`:
-      * hand   -> /hand/<group>/shape_N   (visual + collision)
-      * cube   -> /cube/<group>/shape_N
+      * franka -> /franka/<group>/shape_N   (visual + collision)
+      * table  -> /table/<group>/shape_N
       * ground -> /ground
+    The duck is a soft body (particles), logged separately by log_state.
     """
     obj = model._explore_shape_object
 
@@ -151,7 +204,7 @@ def make_shape_path_fn(model):
         o = obj[s]
         if o == "ground":
             return "/ground"
-        return f"/{o}/{group}/shape_{batch_index}"   # /hand/... or /cube/...
+        return f"/{o}/{group}/shape_{batch_index}"   # /franka/... or /table/...
 
     return fn
 
@@ -159,12 +212,14 @@ def make_shape_path_fn(model):
 def log_initial_frame(viewer, model, show_collision=True) -> "newton.State":
     """Upload the model to Rerun and log the rest-pose frame at t=0.
 
-    Entity tree is organized by object: /hand/{visual,collision},
-    /cube/{visual,collision}, /ground. show_collision=True also renders the
-    COLLIDE_SHAPES geometry. Returns the State for later stepping.
+    Entity tree is organized by object: /franka/{visual,collision},
+    /table/{visual,collision}, /ground, plus the duck soft-body particles.
+    show_collision=True also renders the COLLIDE_SHAPES geometry. Returns the
+    State for later stepping.
     """
     viewer.show_collision = show_collision   # render collision geometry (read by set_model)
     viewer.show_visual = True                # keep the visual meshes too
+    viewer.show_particles = True             # render the duck soft body (point cloud at /model/particles)
     viewer.shape_path_fn = make_shape_path_fn(model)  # object-centric shape paths (read by set_model)
 
     viewer.set_model(model)
@@ -182,6 +237,6 @@ def log_initial_frame(viewer, model, show_collision=True) -> "newton.State":
 # %%
 
 state = log_initial_frame(viewer, model)
-print("Step 3 done — Allegro hand sent to Rerun at t=0.")
+print("Step 3 done — Franka + duck scene sent to Rerun at t=0.")
 
 # %%
